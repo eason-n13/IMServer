@@ -11,3 +11,6 @@ add_executable(IMClient client/main.cpp)
 
 target_compile_options(IMServer PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(IMClient PRIVATE -Wall -Wextra -Wpedantic)
+
+target_include_directories(IMServer PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(IMClient PRIVATE ${CMAKE_SOURCE_DIR}/include)
