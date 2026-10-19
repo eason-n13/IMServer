@@ -62,7 +62,7 @@ int Tcpclient::sendall(const std::string& massege)
         {
             ssize_t n = send(client_socket_.get_socketfd(),
                              massege.data() + offset,
-                             massege.size() - offset , 0);
+                             massege.size() - offset , MSG_NOSIGNAL);
             if (n > 0)  //表示发送了n个字节信息
             {
                 offset += static_cast<size_t>(n);

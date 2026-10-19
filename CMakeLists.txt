@@ -14,3 +14,22 @@ target_compile_options(IMClient PRIVATE -Wall -Wextra -Wpedantic)
 
 target_include_directories(IMServer PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(IMClient PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+include(CTest)
+
+if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+    add_test(
+        NAME SimpleTCPTest
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/tests/integration_test.py
+                $<TARGET_FILE:IMServer>
+                $<TARGET_FILE:IMClient>
+    )
+
+    set_tests_properties(
+        SimpleTCPTest
+        PROPERTIES TIMEOUT 15
+    )
+endif()
