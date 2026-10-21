@@ -51,7 +51,7 @@ int Tcpclient::run()
     while (1)
     {
         // 使用poll进行监听
-        ret = poll(pfds, 2, -1);
+        ret = poll(pfds, 2, -1);   //如果没有事件会一直阻塞在这里
         if (ret < 0)
         {
             if (errno == EINTR)
@@ -61,11 +61,12 @@ int Tcpclient::run()
             perror("poll");
             return 1;
         }
-        if (pfds[0].revents & (POLLNVAL))
+        if (pfds[0].revents & (POLLNVAL))  //POLLNVAL这个是无效的fd
         {
             std::cerr << "stdin poll error\n";
             return 1;
         }
+        //POLLIN | POLLHUP| POLLERR，这些信号recv会处理
         if (pfds[0].revents & (POLLIN | POLLHUP| POLLERR)) // 代表pfds[0].fd的事件触发
         {
             char buf[4096]{};
@@ -97,7 +98,7 @@ int Tcpclient::run()
                     }
                 }
             }
-            else if (n == 0)
+            else if (n == 0)  //对端关闭连接，断开
             {
                 // 把缓存区的内容补上然后发送
                 if (!massege.empty())

@@ -116,6 +116,7 @@ int Tcpserver::run()
                         {
                             continue;
                         }
+                        // 非阻塞模式读完了返回-1（EAGAIN 或者 EWOULDBLOCK），不会死等
                         if (errno == EAGAIN || errno == EWOULDBLOCK) // 没有连接了
                         {
                             break;
@@ -124,7 +125,7 @@ int Tcpserver::run()
                         perror("accept");
                         break;
                     }
-                    else
+                    else // client_fd > 0，接受到用户端的连接
                     {
                         // 在堆上创建一个client_socket的副本对象，然后这个智能指针指向它
                         clientstate client;
@@ -155,29 +156,19 @@ int Tcpserver::run()
                 int client_fd = events[i].data.fd;
                 // 检查客户端是否存在
                 auto it = clients_.find(client_fd);
-                if (it == clients_.end())
+                if (it == clients_.end()) // 客户端连接不存在
                 {
                     continue;
                 }
                 // 事件类型
                 uint32_t event_type = events[i].events;
-                if (event_type & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) // 需要接收消息
+                // 需要接收客户端发送的消息
+                if (event_type & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))
                 {
                     bool alive = handleclient(client_fd, epoll_socket.get_socketfd());
-                    if (!alive)
+                    if (!alive) // handleclient处理失败，对面客户端断开或者失效
                     {
-                        // 第一步：从 epoll 移除
-                        if (epoll_ctl(
-                                epoll_socket.get_socketfd(),
-                                EPOLL_CTL_DEL,
-                                client_fd,
-                                nullptr) < 0)
-                        {
-                            perror("epoll_ctl DEL client");
-                        }
-                        // 第二步：从容器删除
-                        clients_.erase(it);
-                        // 删除后退出
+                        removeclient(client_fd, epoll_socket.get_socketfd());
                         continue;
                     }
                 }
@@ -214,24 +205,15 @@ int Tcpserver::run()
                     // 判断是否发送失败
                     if (send_failed)
                     {
-                        // 第一步：从 epoll 移除
-                        if (epoll_ctl(
-                                epoll_socket.get_socketfd(),
-                                EPOLL_CTL_DEL,
-                                client_fd,
-                                nullptr) < 0)
-                        {
-                            perror("epoll_ctl DEL client");
-                        }
-                        // 第二步：从容器删除
-                        clients_.erase(it);
+                        removeclient(client_fd, epoll_socket.get_socketfd());
+                        continue;
                     }
-                    // 结束循环后判断信息发送完了吗
-                    else if (client.sent == client.output.size())
+                    // 结束循环后并发送成功后判断信息发送完了吗
+                    if (client.sent == client.output.size())
                     {
                         epoll_event ev{};
                         ev.data.fd = client_fd;
-                        ev.events = EPOLLIN | EPOLLRDHUP;
+                        ev.events = EPOLLIN | EPOLLRDHUP; // 修改权限
                         if (epoll_ctl(
                                 epoll_socket.get_socketfd(),
                                 EPOLL_CTL_MOD,
@@ -240,10 +222,7 @@ int Tcpserver::run()
                         {
                             perror("epoll_ctl MOD");
                             // 在修改失败的话清理掉epoll中的这个连接
-                            epoll_ctl(epoll_socket.get_socketfd(),
-                                      EPOLL_CTL_DEL,
-                                      it->first, nullptr);
-                            clients_.erase(it);
+                            removeclient(client_fd, epoll_socket.get_socketfd());
                             continue;
                         }
                         client.sent = 0;
@@ -286,42 +265,9 @@ bool Tcpserver::handleclient(int fd, int epoll_fd)
                 std::string message = clients_[fd].input.substr(0, pos + 1);
                 clients_[fd].input.erase(0, pos + 1);
                 std::cout << "receive:" << message;
-                // 现在发送给除了自己以外的客户端
-                // 构造发送文本
-                std::string text = "[fd=" + std::to_string(fd) + "]:" + message;
-                std::vector<int> remove_fds; // 保存超限文件
-                for (auto &it : clients_)
+                if(!processmessage(fd, message, epoll_fd))
                 {
-                    constexpr size_t MAX_OUTPUT = 1024 * 1024; // 消息上限1mb
-                    if (it.first == fd)
-                    {
-                        continue;
-                    }
-                    size_t pending = it.second.output.size() - it.second.sent; // 目前消息长度
-                    if (text.size() > MAX_OUTPUT || pending > MAX_OUTPUT - text.size())
-                    {
-                        std::cerr << "Client output too large: " << it.first << '\n';
-                        remove_fds.push_back(it.first);
-                        continue;
-                    }
-                    else
-                    {
-                        it.second.output.append(text);
-                    }
-                    epoll_event ev{};
-                    ev.data.fd = it.first;
-                    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, it.first, &ev) < 0)
-                    {
-                        perror("epoll_ctl MOD EPOLLOUT");
-                        //需要删除该连接
-                        remove_fds.push_back(it.first);
-                    }
-                }
-                for (int target_fd : remove_fds)  //将超限的删掉
-                {
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, target_fd, nullptr);
-                    clients_.erase(target_fd);
+                    return false;
                 }
             }
         }
@@ -362,4 +308,256 @@ bool Tcpserver::setnonblocking(int fd)
         return false;
     }
     return true;
+}
+
+// 用户名函数
+int Tcpserver::handlename(int fd, const std::string &username,int epoll_fd)
+{
+    auto it = clients_.find(fd);
+    if (it == clients_.end())
+    {
+        return 1;
+    }
+    // 1. 当前客户端是否已经命名？
+    if (!it->second.username.empty())
+    {
+        if(!enqueue_message(fd, "当前连接已设置用户名\n", epoll_fd))
+        {
+            return -1;
+        }
+        return 1;
+    }
+    // 2. 用户名长度是否合法？用户名长度为 1–32 字节。
+    if (username.size() < 1 || username.size() > 32)
+    {
+        if(!enqueue_message(fd, "用户名长度不对\n", epoll_fd))
+        {
+            return -1;
+        }
+        return 1;
+    }
+    // 3. 用户名字符是否合法？只允许 ASCII 字母、数字、下划线
+    if (std::any_of(username.begin(), username.end(), [](unsigned char c)
+                    {
+                        return !(std::isalnum(c) || c == '_'); // 都满足就不执行下面的，返回假
+                    }))
+    { // 为真执行下面的
+        if(!enqueue_message(fd, "用户名字符非法\n", epoll_fd))
+        {
+            return -1;
+        }
+        return 1;
+    }
+    // 4. 用户名是否已经被占用？
+    if (online_users_.find(username) != online_users_.end()) // 存在这个名字
+    {
+        if(!enqueue_message(fd, "用户名已经被占用\n", epoll_fd))
+        {
+            return -1;
+        }
+        return 1;
+    }
+    // 5. 全部通过后更新两个容器
+    it->second.username = username;
+    online_users_.emplace(username, fd);
+    if(!enqueue_message(fd, "用户名设置成功：" + username + "\n", epoll_fd))
+    {
+        return -1;
+    }
+    return 0;
+}
+
+// 判断命名
+bool Tcpserver::processmessage(int fd, const std::string &message, int epoll_fd)
+{
+    auto it = clients_.find(fd);
+    if (it == clients_.end())
+    {
+        return false;
+    }
+    // 1. 去掉末尾的 \n
+    std::string line = message;
+    if (!line.empty() && line.back() == '\n')
+    {
+        line.pop_back();
+    }
+    // 2. 判断 /name 命令,允许未命名客户端执行
+    if (line.rfind("/name ", 0) == 0 || line == "/name") // 检查是不是\name开头
+    {
+        if (line == "/name")
+        {
+            return enqueue_message(fd, "用户名不能为空\n", epoll_fd);
+        }
+        if(handlename(fd, line.substr(6),epoll_fd) == -1)
+        {
+            return false;
+        }
+        return true;
+    }
+    if (it->second.username.empty())
+    {
+        return enqueue_message(fd, "请先设置用户名\n", epoll_fd);
+    }
+    if (line == "/msg" || line.rfind("/msg ", 0) == 0)
+    {
+        if (line == "/msg")
+        {
+            return enqueue_message(fd, "发送信息不能为空\n", epoll_fd);
+        }
+        if(!handleprivatemessage(fd, line.substr(5), epoll_fd))
+        {
+            return false;
+        }
+        return true;
+    }
+    // 其他未知命令
+    if (!line.empty() && line[0] == '/')
+    {
+        return enqueue_message(fd, "未知命令\n", epoll_fd);
+    }
+    // 有用户名,并且不是未知命令就可以进行广播
+    // 构造发送文本
+    std::string text = "[" + it->second.username + "]:" + message;
+    std::vector<int> remove_fds; // 保存超限文件
+    // 进行广播，讲消息加入到格客户端的缓冲区，便于他们提取
+    for (auto &it : clients_)
+    {
+        if (it.first == fd) // 自己的输出缓存区不保存广播内容
+        {
+            continue;
+        }
+        if (!enqueue_message(it.first, text, epoll_fd))
+        {
+            remove_fds.push_back(it.first);
+        }
+    }
+    for (int target_fd : remove_fds) // 将超限的删掉
+    {
+        removeclient(target_fd, epoll_fd);
+    }
+    return true;
+}
+
+// 消息队列
+bool Tcpserver::enqueue_message(int fd, const std::string &text, int epoll_fd)
+{
+    constexpr size_t MAX_OUTPUT = 1024 * 1024;
+    // 1. 查找目标客户端
+    // 使用 clients_.find(fd)
+    // 不存在则返回 false
+    auto it = clients_.find(fd);
+    if (it == clients_.end())
+    {
+        return false;
+    }
+    // 2. 获取目标客户端的 clientstate
+    // 使用引用，避免复制
+    clientstate &client = it->second;
+    // 3. 计算当前尚未发送的数据量
+    // pending = output.size() - sent
+    size_t pending = client.output.size() - client.sent;
+    // 4. 判断追加 text 后是否超过 1 MiB
+    // 超限返回 false
+    if (text.size() > MAX_OUTPUT || text.size() > MAX_OUTPUT - pending)
+    {
+        return false;
+    }
+    // 5. 将 text 追加到 output
+    // 注意：使用 append()，不能使用 =
+    if (client.sent > 0)
+    {
+        client.output.erase(0, client.sent);
+        client.sent = 0;
+    }
+    client.output.append(text);
+    // 6. 开启该客户端的 EPOLLOUT
+    epoll_event ev{};
+    ev.data.fd = fd;
+    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0)
+    {
+        perror("EPOLL_CTL_MOD false");
+        return false;
+    }
+    // 7. 入队成功
+    return true;
+}
+
+void Tcpserver::removeclient(int fd, int epoll_fd)
+{
+    // 1. 查找客户端
+    auto it = clients_.find(fd);
+    if (it == clients_.end())
+    {
+        return;
+    }
+    // 2. 如果已经设置用户名
+    // 从 online_users_ 删除用户名
+    if (!it->second.username.empty())
+    {
+        online_users_.erase(it->second.username);
+    }
+    // 3. 从 epoll 中移除客户端
+    // EPOLL_CTL_DEL
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0)
+    {
+        perror("EPOLL_CTL_DEL");
+    }
+    // 4. 从 clients_ 中删除客户端
+    // unique_ptr<Socket> 会自动释放 Socket
+    clients_.erase(fd);
+}
+
+bool Tcpserver::handleprivatemessage(int fd, const std::string &args, int epoll_fd)
+{
+    // 1. 根据 fd 查找发送者
+    auto it = clients_.find(fd);
+    if (it == clients_.end())
+    {
+        return false;
+    }
+    // 2. 从 args 中提取目标用户名和消息正文
+    // 例如 "Bob hello there"
+    // target = "Bob"
+    // content = "hello there"
+    size_t pos = args.find(' ');
+    if (pos == std::string::npos)
+    {
+        return enqueue_message(fd, "私聊格式错误，正确格式：/msg 用户名 消息\n", epoll_fd);
+    }
+    std::string target = args.substr(0, pos);
+    std::string content = args.substr(pos + 1);
+    // 3. 判断格式是否正确
+    // 目标用户名或消息正文不能为空
+    if (target.empty() || content.empty())
+    {
+        
+        return enqueue_message(fd, "私聊格式错误：用户名或消息不能为空\n", epoll_fd);
+    }
+    // 4. 判断是否给自己发私聊
+    if (target == it->second.username)
+    {
+        
+        return enqueue_message(fd, "不能给自己发送私聊\n", epoll_fd);
+    }
+    // 5. 在 online_users_ 中查找目标用户
+    // 找不到则提示用户不在线
+    if (online_users_.find(target) == online_users_.end())
+    {
+        
+        return enqueue_message(fd, "用户不在线\n", epoll_fd);
+    }
+    // 6. 构造私聊消息
+    // [private Alice]: hello there
+    std::string text = "[private " + it->second.username + "]:" + content + '\n';
+    // 7. 使用 enqueue_message() 给目标用户入队
+    int target_fd = online_users_[target];
+    if (!enqueue_message(target_fd, text, epoll_fd))
+    {
+        removeclient(target_fd, epoll_fd);
+        return enqueue_message(fd, "私聊发送失败：目标连接不可用\n", epoll_fd);
+    }
+    // 8. 入队成功后，给发送者返回确认提示
+    // 注意：入队成功不代表 Bob 已经收到消息
+    return enqueue_message(fd, "私聊消息已入队\n", epoll_fd);
 }
