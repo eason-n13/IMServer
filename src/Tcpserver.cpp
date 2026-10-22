@@ -64,22 +64,15 @@ int Tcpserver::run()
     std::cout << "Server start..." << std::endl;
     std::cout << "Listen port:" << port_ << std::endl;
     // 创建epoll来管理
-    Socket epoll_socket(epoll_create1(EPOLL_CLOEXEC)); // 创建一个epoll管理
-    if (epoll_socket.get_socketfd() < 0)
+    Epoll epoll_socket;
+    if (!epoll_socket.valid())
     {
-        perror("epoll_create1:");
+        perror("epoll_create:");
         return 1;
     }
-    // 创建服务端事件，加入刚刚创建的epoll中进行监控
-    struct epoll_event ev{};
-    ev.data.fd = listen_socket_.get_socketfd();
-    ev.events = EPOLLIN;
-    // 开始监听,这个epoll要同时监控服务端与各个客户端
-    ret = epoll_ctl(epoll_socket.get_socketfd(), EPOLL_CTL_ADD,
-                    ev.data.fd, &ev);
-    if (ret < 0)
+    // 把这个监听客户端加入epoll中进行监听
+    if(!epoll_socket.add(listen_socket_.get_socketfd(),EPOLLIN))
     {
-        perror("epoll_ctl:");
         return 1;
     }
     // 定义一个存放就绪事件的数组
@@ -88,7 +81,7 @@ int Tcpserver::run()
     while (1)
     {
         // 阻塞等待，等待内核说有任务就绪后就继续进行,会返回n个就绪好的任务
-        int n = epoll_wait(epoll_socket.get_socketfd(), events, 10, -1);
+        int n = epoll_socket.wait(events,10,-1);
         if (n < 0)
         {
             if (errno == EINTR) // 被干扰中断
@@ -128,7 +121,7 @@ int Tcpserver::run()
                     else // client_fd > 0，接受到用户端的连接
                     {
                         // 在堆上创建一个client_socket的副本对象，然后这个智能指针指向它
-                        clientstate client;
+                        clientstate client{};
                         client.socket = std::make_unique<Socket>(client_fd);
                         // 对这些客户端fd进行设置无阻塞
                         if (!setnonblocking(client_fd))
@@ -136,15 +129,9 @@ int Tcpserver::run()
                             continue;
                         }
                         // 将这个客户端加入到epoll监听中
-                        struct epoll_event client_event{};
-                        client_event.data.fd = client_fd;
-                        // EPOLLRDHUP检查对端是否关闭连接
-                        client_event.events = EPOLLIN | EPOLLRDHUP;
-                        ret = epoll_ctl(epoll_socket.get_socketfd(), EPOLL_CTL_ADD, client_event.data.fd, &client_event);
-                        if (ret < 0)
+                        if(!epoll_socket.add(client_fd,EPOLLIN))
                         {
-                            perror("epoll_ctl:");
-                            continue;
+                            return 1;
                         }
                         // 转移所有权给类中对象，这样就不会在这个if后被析构
                         clients_.emplace(client_fd, std::move(client));
@@ -165,10 +152,10 @@ int Tcpserver::run()
                 // 需要接收客户端发送的消息
                 if (event_type & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))
                 {
-                    bool alive = handleclient(client_fd, epoll_socket.get_socketfd());
+                    bool alive = handleclient(client_fd, epoll_socket);
                     if (!alive) // handleclient处理失败，对面客户端断开或者失效
                     {
-                        removeclient(client_fd, epoll_socket.get_socketfd());
+                        removeclient(client_fd, epoll_socket);
                         continue;
                     }
                 }
@@ -205,24 +192,17 @@ int Tcpserver::run()
                     // 判断是否发送失败
                     if (send_failed)
                     {
-                        removeclient(client_fd, epoll_socket.get_socketfd());
+                        removeclient(client_fd, epoll_socket);
                         continue;
                     }
                     // 结束循环后并发送成功后判断信息发送完了吗
                     if (client.sent == client.output.size())
                     {
-                        epoll_event ev{};
-                        ev.data.fd = client_fd;
-                        ev.events = EPOLLIN | EPOLLRDHUP; // 修改权限
-                        if (epoll_ctl(
-                                epoll_socket.get_socketfd(),
-                                EPOLL_CTL_MOD,
-                                client_fd,
-                                &ev) < 0)
+                        //发送完了回收权限
+                        if (!epoll_socket.modify(client_fd,EPOLLIN | EPOLLRDHUP))
                         {
-                            perror("epoll_ctl MOD");
                             // 在修改失败的话清理掉epoll中的这个连接
-                            removeclient(client_fd, epoll_socket.get_socketfd());
+                            removeclient(client_fd, epoll_socket);
                             continue;
                         }
                         client.sent = 0;
@@ -234,7 +214,7 @@ int Tcpserver::run()
     }
 }
 
-bool Tcpserver::handleclient(int fd, int epoll_fd)
+bool Tcpserver::handleclient(int fd, Epoll& epoll_fd)
 {
     // 循环接收信息  //现在升级，接收到消息后拼接然后发送给各个客户端
     char buf[4096]{};
@@ -311,7 +291,7 @@ bool Tcpserver::setnonblocking(int fd)
 }
 
 // 用户名函数
-int Tcpserver::handlename(int fd, const std::string &username,int epoll_fd)
+int Tcpserver::handlename(int fd, const std::string &username,Epoll& epoll_fd)
 {
     auto it = clients_.find(fd);
     if (it == clients_.end())
@@ -368,7 +348,7 @@ int Tcpserver::handlename(int fd, const std::string &username,int epoll_fd)
 }
 
 // 判断命名
-bool Tcpserver::processmessage(int fd, const std::string &message, int epoll_fd)
+bool Tcpserver::processmessage(int fd, const std::string &message, Epoll& epoll_fd)
 {
     auto it = clients_.find(fd);
     if (it == clients_.end())
@@ -438,8 +418,8 @@ bool Tcpserver::processmessage(int fd, const std::string &message, int epoll_fd)
     return true;
 }
 
-// 消息队列
-bool Tcpserver::enqueue_message(int fd, const std::string &text, int epoll_fd)
+// 消息队列，函数作用就是，将text放到fd的output区域，并开启fd的接受功能
+bool Tcpserver::enqueue_message(int fd, const std::string &text, Epoll& epoll_fd)
 {
     constexpr size_t MAX_OUTPUT = 1024 * 1024;
     // 1. 查找目标客户端
@@ -471,19 +451,15 @@ bool Tcpserver::enqueue_message(int fd, const std::string &text, int epoll_fd)
     }
     client.output.append(text);
     // 6. 开启该客户端的 EPOLLOUT
-    epoll_event ev{};
-    ev.data.fd = fd;
-    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0)
+    if(!epoll_fd.modify(fd,EPOLLIN | EPOLLRDHUP | EPOLLOUT))
     {
-        perror("EPOLL_CTL_MOD false");
         return false;
     }
     // 7. 入队成功
     return true;
 }
 
-void Tcpserver::removeclient(int fd, int epoll_fd)
+void Tcpserver::removeclient(int fd, Epoll& epoll_fd)
 {
     // 1. 查找客户端
     auto it = clients_.find(fd);
@@ -499,16 +475,13 @@ void Tcpserver::removeclient(int fd, int epoll_fd)
     }
     // 3. 从 epoll 中移除客户端
     // EPOLL_CTL_DEL
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0)
-    {
-        perror("EPOLL_CTL_DEL");
-    }
+    epoll_fd.remove(fd);
     // 4. 从 clients_ 中删除客户端
     // unique_ptr<Socket> 会自动释放 Socket
     clients_.erase(fd);
 }
 
-bool Tcpserver::handleprivatemessage(int fd, const std::string &args, int epoll_fd)
+bool Tcpserver::handleprivatemessage(int fd, const std::string &args, Epoll& epoll_fd)
 {
     // 1. 根据 fd 查找发送者
     auto it = clients_.find(fd);
