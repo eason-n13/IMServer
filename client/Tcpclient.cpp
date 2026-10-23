@@ -67,8 +67,10 @@ int Tcpclient::run()
             return 1;
         }
         //POLLIN | POLLHUP| POLLERR，这些信号recv会处理
+        //键盘输入，也就是自己想要发送的信息
         if (pfds[0].revents & (POLLIN | POLLHUP| POLLERR)) // 代表pfds[0].fd的事件触发
         {
+            constexpr size_t MAX_LINE = 64 * 1024;  //声明一个最大信息长度
             char buf[4096]{};
             // 不能使用getline，因为他要求读到‘\n’才结束，而poll只要检查到缓存区有内容就会唤醒
             ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
@@ -81,7 +83,18 @@ int Tcpclient::run()
                     size_t pos = massege.find('\n'); // 所以要循环发送
                     if (pos == std::string::npos)
                     {
+                        //没找到换行，判断要发送的信息是否长度超出
+                        if (massege.size() > MAX_LINE)
+                        {
+                            std::cerr << "Message too long\n";
+                            return 1;
+                        }
                         break; // 如果没有就退出
+                    }
+                    if (pos > MAX_LINE)  //找到换行符的位置，发现太长
+                    {
+                        std::cerr << "Message too long\n";
+                        return 1;
                     }
                     // 有就发送
                     std::string line = massege.substr(0, pos + 1); // 先截取
@@ -131,6 +144,7 @@ int Tcpclient::run()
             std::cerr << "server socket invalid\n";
             return 1;
         }
+        //对面发送的信息
         if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) // 代表pfds[1].fd的事件触发,客户端需要接收
         {
 
@@ -162,6 +176,7 @@ int Tcpclient::run()
     return 0;
 }
 
+//这里的massege是已经判断好的
 int Tcpclient::sendall(const std::string &massege)
 {
     // 定义一个指针偏移

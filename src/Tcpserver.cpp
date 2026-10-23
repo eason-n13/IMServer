@@ -131,7 +131,7 @@ int Tcpserver::run()
                         // 将这个客户端加入到epoll监听中
                         if(!epoll_socket.add(client_fd,EPOLLIN))
                         {
-                            return 1;
+                            continue;
                         }
                         // 转移所有权给类中对象，这样就不会在这个if后被析构
                         clients_.emplace(client_fd, std::move(client));
